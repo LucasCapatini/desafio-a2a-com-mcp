@@ -24,6 +24,7 @@ python validador/validar.py --agente http://localhost:7300 --mcp http://localhos
 - O validador (36 verificações; 1 a 20 contra o MCP, 21 a 36 contra o A2A) só é confiável com **os dois processos recém-iniciados**: as reservas ficam em memória e uma execução altera a seguinte. Antes de rodar, confirme que nenhum processo antigo segura as portas 7300/7301; senão os novos falham no bind e o validador testa código velho.
 - Não há suíte de testes própria. A verificação é o validador mais o Fluxo do avaliador (passos 7 a 13 do enunciado), que inclui reiniciar o servidor MCP entre o `input_required` e o retry.
 - O servidor não sobe sem `REQUEST_STATE_SECRET` (mínimo de 32 bytes). Para o retry sobreviver a um restart, use a mesma secret.
+- O enunciado aceita Python 3.10. Por isso `starlette` está travado em `1.7.0`: a 1.8.0 em diante exige Python ≥ 3.11. Antes de mudar qualquer versão travada, confira o `Requires-Python` dela.
 
 ## Arquitetura
 
@@ -36,7 +37,7 @@ Dois processos que só conversam por HTTP. O agente nunca importa código do ser
 - O SDK já cuida de: `-32602`/HTTP 400 para `_meta` incompleto, `-32020` para header divergente do corpo, `-32602` para tool ou resource inexistente e para `requestState` inválido.
 
 **`agente/agente_a2a/`**:
-- `host_mcp.py` é o cliente MCP. Usa `client.session.call_tool(..., allow_input_required=True)` para receber o `input_required` cru, **sem callback de elicitation**, e sobrescreve `_build_capabilities` para declarar só `{"elicitation": {"form": {}}}`, já que o SDK declararia `form` e `url` juntos. `Traceparent` preserva o trace-id e gera um span-id por request.
+- `host_mcp.py` é o cliente MCP. Usa `client.session.call_tool(..., allow_input_required=True)` para receber o `input_required` cru, **sem callback de elicitation**, e sobrescreve `_build_capabilities` para declarar só `{"elicitation": {"form": {}}}`, já que o SDK declararia `form` e `url` juntos. `_pausa` descobre no `requestedSchema` a única propriedade com `enum`/`const`, sem assumir o nome `sala`. `Traceparent` valida o header no formato W3C, preserva o trace-id e gera um span-id por request.
 - `ponte.py` é o coração do desafio. `_iniciar` faz, por Task, `tools/list`, `resources/read` e `tools/call`. `_aplicar` converte `Pausado` em `TASK_STATE_INPUT_REQUIRED` com a linha exata `alternativas: a, b` e guarda o `requestState` na Task. `_continuar` trata `escolha=<id>|recusar` e refaz o `tools/call` com a mesma chave e o estado ecoado.
 - `tarefas.py` guarda as Tasks em memória, com um lock por Task. `Tarefa.pausa` nunca é serializado: o `requestState` não pode vazar em nenhuma resposta A2A, e a verificação 34 confere isso.
 - `a2a.py` publica o Agent Card (idêntico a `exemplos/wire/07`) e o JSON-RPC (`SendMessage`, `GetTask`, com respostas no formato `{"task": ...}`). Erros: `-32001` para Task inexistente e `-32004` para Task em estado terminal.
