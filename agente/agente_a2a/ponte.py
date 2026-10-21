@@ -15,11 +15,18 @@ from typing import Any
 from mcp.shared.exceptions import MCPError
 
 from agente_a2a.host_mcp import TOOL_RESERVA, Concluido, HostMCP, Pausado, Traceparent
-from agente_a2a.tarefas import CANCELED, COMPLETED, FAILED, WORKING, Tarefa, Tarefas
+from agente_a2a.tarefas import CANCELED, COMPLETED, FAILED, INPUT_REQUIRED, WORKING, Pausa, Tarefa, Tarefas
 
 PEDIDO = re.compile(r"^\s*reservar\s+sala=(\S+)\s+inicio=(\S+)\s+fim=(\S+)\s+responsavel=(.+?)\s*$")
+ESCOLHA = re.compile(r"^\s*escolha=(\S+)\s*$")
+RECUSAR = "recusar"
 FORMATO = "reservar sala=<id> inicio=<iso8601> fim=<iso8601> responsavel=<nome>"
 CAMPOS_ARTIFACT = ("reserva", "sala", "inicio", "fim", "responsavel")
+
+
+def linha_de_alternativas(opcoes: list[str]) -> str:
+    """A mensagem da pausa, byte a byte: sem prefixo, na ordem do enum da elicitation."""
+    return "alternativas: " + ", ".join(opcoes)
 
 log = logging.getLogger("agente_a2a")
 
@@ -87,12 +94,56 @@ class Ponte:
         async with tarefa.trava:
             if tarefa.terminal:
                 raise ErroA2A(OPERACAO_NAO_SUPORTADA, f"Task {task_id} esta em estado terminal: {tarefa.estado}")
-            raise ErroA2A(OPERACAO_NAO_SUPORTADA, f"Task {task_id} nao esta aguardando entrada")
+            pausa = tarefa.pausa
+            if tarefa.estado != INPUT_REQUIRED or pausa is None:
+                raise ErroA2A(OPERACAO_NAO_SUPORTADA, f"Task {task_id} nao esta aguardando entrada")
+            tarefa.historico.append(mensagem)
+            if traceparent:
+                tarefa.trace = Traceparent(traceparent)
+
+            casamento = ESCOLHA.match(texto_da_mensagem(mensagem))
+            escolha = casamento.group(1) if casamento else None
+            if escolha == RECUSAR:
+                resposta: dict[str, Any] = {"action": "decline"}
+            elif escolha in pausa.opcoes:
+                resposta = {"action": "accept", "content": {"sala": escolha}}
+            else:
+                # Escolha fora do enum da elicitation: a Task continua pausada e repete a pergunta.
+                tarefa.transitar(INPUT_REQUIRED, linha_de_alternativas(pausa.opcoes))
+                return tarefa
+
+            tarefa.transitar(WORKING)
+            tarefa.pausa = None
+            try:
+                # O retry: mesmo tools/call com id novo, a mesma chave do inputRequests e o
+                # requestState devolvido exatamente como veio, sem abrir nem reconstruir.
+                resultado = await self.host.chamar(
+                    TOOL_RESERVA,
+                    tarefa.argumentos,
+                    tarefa.trace,
+                    input_responses={pausa.chave: resposta},
+                    request_state=pausa.request_state,
+                )
+            except MCPError as e:
+                tarefa.transitar(FAILED, f"Erro do servidor MCP: {e.error.message}")
+                return tarefa
+            except Exception as e:
+                log.exception("task=%s falha ao falar com o servidor MCP", tarefa.id)
+                tarefa.transitar(FAILED, f"Falha ao falar com o servidor MCP: {type(e).__name__}")
+                return tarefa
+            self._aplicar(tarefa, resultado)
+        return tarefa
 
     def _aplicar(self, tarefa: Tarefa, resultado: Concluido | Pausado) -> None:
         """Converte o resultado MCP no estado da Task."""
         if isinstance(resultado, Pausado):
-            tarefa.transitar(FAILED, "O servidor MCP pediu uma escolha, mas a pausa ainda nao e suportada")
+            # A ponte: input_required do MCP vira TASK_STATE_INPUT_REQUIRED no A2A, e o
+            # requestState fica guardado nesta Task (e so nela) ate a resposta chegar.
+            if not resultado.opcoes:
+                tarefa.transitar(FAILED, "O servidor MCP pediu uma escolha sem oferecer alternativas")
+                return
+            tarefa.pausa = Pausa(chave=resultado.chave, opcoes=resultado.opcoes, request_state=resultado.request_state)
+            tarefa.transitar(INPUT_REQUIRED, linha_de_alternativas(resultado.opcoes))
             return
         if resultado.erro:
             tarefa.transitar(FAILED, resultado.texto or "Erro de execucao da tool sem mensagem")
