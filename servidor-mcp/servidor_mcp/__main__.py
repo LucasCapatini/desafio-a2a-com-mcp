@@ -58,12 +58,15 @@ class RegistroDeRequests:
             params = item.get("params") if isinstance(item.get("params"), dict) else {}
             meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
             alvo = params.get("name") or params.get("uri")
+            capabilities = meta.get("io.modelcontextprotocol/clientCapabilities")
             log.info(
-                "method=%s id=%s%s traceparent=%s",
+                "method=%s id=%s%s traceparent=%s capabilities=%s%s",
                 item.get("method"),
                 json.dumps(item.get("id")),
                 f" name={alvo}" if alvo else "",
                 meta.get("traceparent", "-"),
+                json.dumps(capabilities, separators=(",", ":")) if capabilities is not None else "-",
+                " retry=sim" if "requestState" in params else "",
             )
 
 
