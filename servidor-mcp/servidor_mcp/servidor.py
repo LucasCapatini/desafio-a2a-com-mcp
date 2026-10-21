@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Annotated, Literal
+from typing import Any
 
-from mcp.server.mcpserver import (
-    AcceptedElicitation,
-    Elicit,
-    ElicitationResult,
-    MCPServer,
-    RequestStateSecurity,
-    Resolve,
-)
+from mcp.server.mcpserver import Context, MCPServer, RequestStateSecurity
 from mcp.server.mcpserver.exceptions import ToolError
-from pydantic import BaseModel, Field, create_model
+from mcp.shared.exceptions import MCPError
+from mcp_types import INVALID_PARAMS, MISSING_REQUIRED_CLIENT_CAPABILITY, InputRequiredResult
+from pydantic import BaseModel
 
 from servidor_mcp import dominio
 
@@ -53,6 +49,8 @@ mcp = MCPServer(
 )
 
 MENSAGEM_ELICITATION = "A sala pedida esta ocupada nesse intervalo. Escolha uma alternativa."
+CHAVE_ESCOLHA = "escolha_de_sala"
+VERSAO_ESTADO = 1
 
 
 class SalaOut(BaseModel):
@@ -117,48 +115,57 @@ def consultar_disponibilidade(sala: str, inicio: str, fim: str) -> Disponibilida
     )
 
 
-class EscolhaDeSala(BaseModel):
-    """Forma da resposta da elicitation; o schema real restringe `sala` as alternativas."""
+def _exigir_elicitation_form(ctx: Context) -> None:
+    """Capability negociada por request: sem elicitation em form mode, -32021 (HTTP 400).
 
-    sala: str
-
-
-def escolha_de_sala(sala: str, inicio: str, fim: str) -> Elicit[EscolhaDeSala] | None:
-    """Resolver do MRTR: decide se a reserva precisa perguntar algo ao cliente.
-
-    Sala livre: nao pergunta (None). Ocupada com alternativas: devolve um Elicit, que o
-    SDK transforma em `input_required` com o `requestState` selado. Ocupada sem
-    alternativas: erro de execucao. Roda de novo a cada rodada, entao o retry reavalia
-    o conflito com os argumentos selados.
+    Mesma regra do SDK: `elicitation: {}` sem modos conta como form (compatibilidade com
+    revisoes anteriores); declarar so `url` nao conta.
     """
-    pedido = _validar(sala, inicio, fim)
-    if not dominio.conflitos(sala, pedido.inicio, pedido.fim):
-        return None
-    opcoes = dominio.alternativas(pedido)
-    if not opcoes:
-        raise ToolError(dominio.ERRO_SEM_ALTERNATIVA)
-    schema = create_model(
-        "EscolhaDeSalaAlternativa",
-        __base__=EscolhaDeSala,
-        sala=(Literal[tuple(opcoes)], Field(title="Sala", description="Sala alternativa escolhida")),
+    capabilities = ctx.client_capabilities
+    elicitation = capabilities.elicitation if capabilities is not None else None
+    if elicitation is not None and (elicitation.form is not None or elicitation.url is None):
+        return
+    raise MCPError(
+        code=MISSING_REQUIRED_CLIENT_CAPABILITY,
+        message="Client did not declare the form elicitation capability required by reservar_sala",
+        data={"requiredCapabilities": {"elicitation": {"form": {}}}},
     )
-    return Elicit(MENSAGEM_ELICITATION, schema)
 
 
-@mcp.tool(description="Reserva uma sala no intervalo pedido. Em conflito, pergunta qual alternativa usar.")
-def reservar_sala(
-    sala: str,
-    inicio: str,
-    fim: str,
-    responsavel: str,
-    escolha: Annotated[ElicitationResult[EscolhaDeSala], Resolve(escolha_de_sala)],
-) -> ResultadoReserva:
-    if not isinstance(escolha, AcceptedElicitation):
-        motivo = "recusado" if escolha.action == "decline" else "cancelado"
-        return ResultadoReserva(reservado=False, motivo=motivo)
-    destino = escolha.data.sala if escolha.data is not None else sala
+def _pergunta(selado: dict[str, Any]) -> InputRequiredResult:
+    """O `input_required`: uma elicitation em form mode e o pedido selado no requestState.
+
+    O `request_state` sai daqui em texto e o SDK (RequestStateBoundary) o cifra e assina
+    antes de ir para o fio; no retry o handler so recebe de volta o que ele mesmo emitiu.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "sala": {
+                "type": "string",
+                "title": "Sala",
+                "description": "Sala alternativa escolhida",
+                "enum": selado["alternativas"],
+            }
+        },
+        "required": ["sala"],
+    }
+    return InputRequiredResult.model_validate(
+        {
+            "inputRequests": {
+                CHAVE_ESCOLHA: {
+                    "method": "elicitation/create",
+                    "params": {"mode": "form", "message": MENSAGEM_ELICITATION, "requestedSchema": schema},
+                }
+            },
+            "requestState": json.dumps(selado, separators=(",", ":")),
+        }
+    )
+
+
+def _concluir(sala: str, inicio: str, fim: str, responsavel: str) -> ResultadoReserva:
     try:
-        reserva = dominio.reservar(destino, inicio, fim, responsavel)
+        reserva = dominio.reservar(sala, inicio, fim, responsavel)
     except dominio.ErroDeRegra as e:
         raise ToolError(str(e)) from None
     return ResultadoReserva(
@@ -168,6 +175,60 @@ def reservar_sala(
         fim=reserva["fim"],
         responsavel=reserva["responsavel"],
         politica=dominio.POLITICA_VERSAO,
+    )
+
+
+def _retomar(ctx: Context) -> ResultadoReserva | InputRequiredResult:
+    """O retry: reconstroi o pedido a partir do requestState, nunca dos argumentos reenviados.
+
+    O estado ja chega verificado (integridade, expiracao e vinculo com a tool e com os
+    argumentos originais); falhar em qualquer um vira -32602 antes deste ponto. Nada
+    foi guardado em memoria entre as rodadas, entao isto funciona apos um restart.
+    """
+    try:
+        selado = json.loads(ctx.request_state or "")
+        if selado.get("v") != VERSAO_ESTADO:
+            raise ValueError("versao")
+    except ValueError:
+        raise MCPError(code=INVALID_PARAMS, message="Invalid or expired requestState") from None
+
+    resposta = (ctx.input_responses or {}).get(CHAVE_ESCOLHA)
+    if resposta is None:
+        return _pergunta(selado)  # retry sem resposta: pergunta de novo, com o mesmo estado
+    acao = getattr(resposta, "action", None)
+    if acao in ("decline", "cancel"):
+        return ResultadoReserva(reservado=False, motivo="recusado" if acao == "decline" else "cancelado")
+    escolha = (getattr(resposta, "content", None) or {}).get("sala")
+    if acao != "accept" or escolha not in selado["alternativas"]:
+        raise ToolError(f"Escolha invalida: {escolha} nao esta entre as alternativas oferecidas")
+    return _concluir(escolha, selado["inicio"], selado["fim"], selado["responsavel"])
+
+
+@mcp.tool(description="Reserva uma sala no intervalo pedido. Em conflito, pergunta qual alternativa usar.")
+def reservar_sala(
+    sala: str, inicio: str, fim: str, responsavel: str, ctx: Context
+) -> ResultadoReserva | InputRequiredResult:
+    if ctx.request_state is not None:
+        return _retomar(ctx)
+
+    pedido = _validar(sala, inicio, fim)
+    if not dominio.conflitos(sala, pedido.inicio, pedido.fim):
+        return _concluir(sala, inicio, fim, responsavel)
+    opcoes = dominio.alternativas(pedido)
+    if not opcoes:
+        raise ToolError(dominio.ERRO_SEM_ALTERNATIVA)
+    _exigir_elicitation_form(ctx)
+    # Tudo que o retry precisa para reconstruir o pedido viaja selado no requestState,
+    # inclusive as alternativas oferecidas: a resposta e validada contra elas.
+    return _pergunta(
+        {
+            "v": VERSAO_ESTADO,
+            "sala": sala,
+            "inicio": inicio,
+            "fim": fim,
+            "responsavel": responsavel,
+            "alternativas": opcoes,
+        }
     )
 
 
