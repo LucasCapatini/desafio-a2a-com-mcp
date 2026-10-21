@@ -13,7 +13,13 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
-DADOS = Path(os.environ.get("DADOS_DIR", Path(__file__).resolve().parents[2] / "dados"))
+def _dados_padrao() -> Path:
+    """`dados/` do repositorio (instalacao editavel) ou, na falta dele, do diretorio atual."""
+    do_repositorio = Path(__file__).resolve().parents[2] / "dados"
+    return do_repositorio if do_repositorio.is_dir() else Path.cwd() / "dados"
+
+
+DADOS = Path(os.environ.get("DADOS_DIR") or _dados_padrao())
 
 FUSO_SAO_PAULO = timezone(timedelta(hours=-3))
 ABERTURA = time(8, 0)
