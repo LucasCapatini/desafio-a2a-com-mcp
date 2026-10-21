@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agente-a2a"
+version = "1.0.0"
+description = "Agente Central de Salas: host MCP por dentro, servidor A2A por fora"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp==2.3.0",
+    "starlette==1.7.0",
+    "uvicorn==0.54.0",
+]
+
+[tool.setuptools]
+packages = ["agente_a2a"]
