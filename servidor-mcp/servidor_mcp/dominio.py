@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
+
 def _dados_padrao() -> Path:
     """`dados/` do repositorio (instalacao editavel) ou, na falta dele, do diretorio atual."""
     do_repositorio = Path(__file__).resolve().parents[2] / "dados"
@@ -60,6 +61,9 @@ _trava = threading.Lock()
 
 
 def _data(valor: str) -> datetime:
+    # `Z` so e aceito por fromisoformat a partir do Python 3.11; normaliza para valer em 3.10.
+    if valor.endswith(("Z", "z")):
+        valor = valor[:-1] + "+00:00"
     try:
         instante = datetime.fromisoformat(valor)
     except ValueError:

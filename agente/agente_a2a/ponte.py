@@ -14,7 +14,7 @@ from typing import Any
 
 from mcp.shared.exceptions import MCPError
 
-from agente_a2a.host_mcp import TOOL_RESERVA, Concluido, HostMCP, Pausado, Traceparent
+from agente_a2a.host_mcp import TOOL_RESERVA, Concluido, HostMCP, Pausado, PerguntaNaoSuportada, Traceparent
 from agente_a2a.tarefas import CANCELED, COMPLETED, FAILED, INPUT_REQUIRED, WORKING, Pausa, Tarefa, Tarefas
 
 PEDIDO = re.compile(r"^\s*reservar\s+sala=(\S+)\s+inicio=(\S+)\s+fim=(\S+)\s+responsavel=(.+?)\s*$")
@@ -78,12 +78,8 @@ class Ponte:
                 return
             tarefa.politica = await self.host.versao_politica(tarefa.trace)
             resultado = await self.host.chamar(TOOL_RESERVA, tarefa.argumentos, tarefa.trace)
-        except MCPError as e:
-            tarefa.transitar(FAILED, f"Erro do servidor MCP: {e.error.message}")
-            return
-        except Exception as e:  # falha de transporte, servidor fora do ar
-            log.exception("task=%s falha ao falar com o servidor MCP", tarefa.id)
-            tarefa.transitar(FAILED, f"Falha ao falar com o servidor MCP: {type(e).__name__}")
+        except Exception as e:
+            self._falhar(tarefa, e)
             return
         self._aplicar(tarefa, resultado)
 
@@ -106,7 +102,7 @@ class Ponte:
             if escolha == RECUSAR:
                 resposta: dict[str, Any] = {"action": "decline"}
             elif escolha in pausa.opcoes:
-                resposta = {"action": "accept", "content": {"sala": escolha}}
+                resposta = {"action": "accept", "content": {pausa.campo: escolha}}
             else:
                 # Escolha fora do enum da elicitation: a Task continua pausada e repete a pergunta.
                 tarefa.transitar(INPUT_REQUIRED, linha_de_alternativas(pausa.opcoes))
@@ -124,15 +120,23 @@ class Ponte:
                     input_responses={pausa.chave: resposta},
                     request_state=pausa.request_state,
                 )
-            except MCPError as e:
-                tarefa.transitar(FAILED, f"Erro do servidor MCP: {e.error.message}")
-                return tarefa
             except Exception as e:
-                log.exception("task=%s falha ao falar com o servidor MCP", tarefa.id)
-                tarefa.transitar(FAILED, f"Falha ao falar com o servidor MCP: {type(e).__name__}")
+                self._falhar(tarefa, e)
                 return tarefa
             self._aplicar(tarefa, resultado)
         return tarefa
+
+    @staticmethod
+    def _falhar(tarefa: Tarefa, erro: Exception) -> None:
+        """Erro ao falar com o servidor MCP termina a Task em FAILED, sem expor o requestState."""
+        if isinstance(erro, MCPError):
+            texto = f"Erro do servidor MCP: {erro.error.message}"
+        elif isinstance(erro, PerguntaNaoSuportada):
+            texto = f"Pergunta do servidor MCP nao suportada: {erro}"
+        else:  # falha de transporte, servidor fora do ar
+            log.error("task=%s falha ao falar com o servidor MCP", tarefa.id, exc_info=erro)
+            texto = f"Falha ao falar com o servidor MCP: {type(erro).__name__}"
+        tarefa.transitar(FAILED, texto)
 
     def _aplicar(self, tarefa: Tarefa, resultado: Concluido | Pausado) -> None:
         """Converte o resultado MCP no estado da Task."""
@@ -142,7 +146,12 @@ class Ponte:
             if not resultado.opcoes:
                 tarefa.transitar(FAILED, "O servidor MCP pediu uma escolha sem oferecer alternativas")
                 return
-            tarefa.pausa = Pausa(chave=resultado.chave, opcoes=resultado.opcoes, request_state=resultado.request_state)
+            tarefa.pausa = Pausa(
+                chave=resultado.chave,
+                campo=resultado.campo,
+                opcoes=resultado.opcoes,
+                request_state=resultado.request_state,
+            )
             tarefa.transitar(INPUT_REQUIRED, linha_de_alternativas(resultado.opcoes))
             return
         if resultado.erro:

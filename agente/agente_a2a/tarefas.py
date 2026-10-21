@@ -34,6 +34,7 @@ class Pausa:
     """O que a ponte guarda entre o input_required e o retry. Opaco para o agente."""
 
     chave: str
+    campo: str
     opcoes: list[str]
     request_state: str | None = field(repr=False)
 

@@ -12,6 +12,7 @@ ponte decidir o que fazer com ele.
 from __future__ import annotations
 
 import os
+import re
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -28,14 +29,25 @@ TOOL_RESERVA = "reservar_sala"
 CAPABILITIES = types.ClientCapabilities(elicitation=types.ElicitationCapability(form=types.FormElicitationCapability()))
 
 
+TRACEPARENT = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
+
+
 class Traceparent:
-    """W3C trace context: mantem o trace-id do cliente A2A e gera um span-id por request MCP."""
+    """W3C trace context: mantem o trace-id do cliente A2A e gera um span-id por request MCP.
+
+    Header ausente ou invalido (formato, versao ff, ids zerados) inicia um trace novo.
+    """
 
     def __init__(self, cabecalho: str | None) -> None:
-        partes = (cabecalho or "").strip().split("-")
-        valido = len(partes) == 4 and len(partes[1]) == 32 and len(partes[2]) == 16 and partes[1] != "0" * 32
-        self.trace_id = partes[1].lower() if valido else secrets.token_hex(16)
-        self.flags = partes[3] if valido else "01"
+        casamento = TRACEPARENT.match((cabecalho or "").strip().lower())
+        valido = (
+            casamento is not None
+            and casamento.group(1) != "ff"
+            and casamento.group(2) != "0" * 32
+            and casamento.group(3) != "0" * 16
+        )
+        self.trace_id = casamento.group(2) if valido else secrets.token_hex(16)
+        self.flags = casamento.group(4) if valido else "01"
 
     def proximo(self) -> str:
         return f"00-{self.trace_id}-{secrets.token_hex(8)}-{self.flags}"
@@ -55,6 +67,7 @@ class Pausado:
     """`input_required`: a pergunta a devolver ao cliente A2A e o estado a guardar, opaco."""
 
     chave: str
+    campo: str
     opcoes: list[str]
     request_state: str | None
 
@@ -142,15 +155,27 @@ class HostMCP:
         return Concluido(erro=bool(resultado.is_error), texto=texto, dados=resultado.structured_content or {})
 
 
+class PerguntaNaoSuportada(Exception):
+    """O `input_required` nao e uma unica escolha fechada em form mode, que e o que a ponte sabe repassar."""
+
+
 def _pausa(resultado: types.InputRequiredResult) -> Pausado:
-    """Extrai a unica elicitation em form mode e as opcoes do schema (enum ou const)."""
+    """Extrai a unica elicitation em form mode e a unica propriedade de escolha fechada (enum ou const).
+
+    O agente nao conhece o nome do campo: ele vem do `requestedSchema`, e a resposta
+    devolve o valor escolhido sob o mesmo nome.
+    """
     pedidos = resultado.model_dump(by_alias=True, mode="json", exclude_none=True).get("inputRequests") or {}
     if len(pedidos) != 1:
-        raise ValueError(f"esperava uma unica entrada em inputRequests, vieram {len(pedidos)}")
+        raise PerguntaNaoSuportada(f"esperava uma unica entrada em inputRequests, vieram {len(pedidos)}")
     chave, pedido = next(iter(pedidos.items()))
     params = pedido.get("params") or {}
     if pedido.get("method") != "elicitation/create" or params.get("mode", "form") != "form":
-        raise ValueError("inputRequest nao e uma elicitation em form mode")
-    campo = ((params.get("requestedSchema") or {}).get("properties") or {}).get("sala") or {}
-    opcoes = list(campo.get("enum") or ([campo["const"]] if "const" in campo else []))
-    return Pausado(chave=chave, opcoes=opcoes, request_state=resultado.request_state)
+        raise PerguntaNaoSuportada("o inputRequest nao e uma elicitation em form mode")
+    propriedades = (params.get("requestedSchema") or {}).get("properties") or {}
+    fechadas = {nome: p for nome, p in propriedades.items() if "enum" in p or "const" in p}
+    if len(fechadas) != 1:
+        raise PerguntaNaoSuportada("a elicitation nao pede uma unica escolha entre opcoes fechadas")
+    campo, propriedade = next(iter(fechadas.items()))
+    opcoes = [str(o) for o in (propriedade["enum"] if "enum" in propriedade else [propriedade["const"]])]
+    return Pausado(chave=chave, campo=campo, opcoes=opcoes, request_state=resultado.request_state)

@@ -9,7 +9,7 @@ description = "Agente Central de Salas: host MCP por dentro, servidor A2A por fo
 requires-python = ">=3.10"
 dependencies = [
     "mcp==2.3.0",
-    "starlette==1.9.0",
+    "starlette==1.7.0",
     "uvicorn==0.54.0",
 ]
 

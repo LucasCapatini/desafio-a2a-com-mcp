@@ -9,7 +9,7 @@ description = "Servidor MCP da Central de Salas (Streamable HTTP, stateless, MRT
 requires-python = ">=3.10"
 dependencies = [
     "mcp==2.3.0",
-    "starlette==1.9.0",
+    "starlette==1.7.0",
     "uvicorn==0.54.0",
 ]
 
